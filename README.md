@@ -11,10 +11,10 @@ Claude Code (Anthropic SDK)
         │ ANTHROPIC_BASE_URL=http://localhost:8082
         │ ANTHROPIC_AUTH_TOKEN=local-stub
         ▼
-  litellm proxy :8082        ← translates Anthropic ↔ OpenAI format
+  litellm proxy :8082  ß      ← translates Anthropic ↔ OpenAI format
         │ api_base=http://localhost:8081/v1
         ▼
-  llama.cpp :8081            ← your local model (DeepSeek-R1-Distill-Qwen-14B)
+  llama.cpp :8081            ← your local model
 ```
 
 The proxy is configured with `model_name: "*"`, so any Claude model name
@@ -37,7 +37,7 @@ You don't have to change Claude Code's `--model` flag.
 Add to your shell profile so commands are always available:
 
 ```sh
-echo 'source /Users/vszalvay/Code/local-claude-code/llm-switch.sh' >> ~/.zshrc
+echo './llm-switch.sh' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -142,7 +142,7 @@ The next `llm-cloud` will fall back to Keychain OAuth.
 
 ## Caveats
 
-- A 14B local model behaves very differently from Claude — tool use, long
+- A smaller, local model behaves very differently from Claude — tool use, long
   context, and complex reasoning will be weaker.
 - litellm drops unsupported parameters automatically (`drop_params: true`).
 - **Don't resume cloud sessions that contain local-mode turns.** Local model
