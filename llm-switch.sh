@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# llm-switch.sh — Switch Claude Code between local llama.cpp and Anthropic cloud
+# llm-switch.sh — Switch Claude Code between a local model and Anthropic cloud
 #
 # USAGE: source ./llm-switch.sh
 # Then use: llm-local | llm-cloud | llm-status
 #
-# Requires litellm proxy to translate Anthropic API format → local OpenAI format.
-# Install with: pip3 install 'litellm[proxy]'
+# LOCAL backend: mlx_lm.server or llama-server (port 8081) → litellm proxy (port 8082)
+#   litellm translates Anthropic /v1/messages → OpenAI /v1/chat/completions.
+#   Start the model server first: ./mlx-server.sh  (or ./llama-server.sh)
 #
 # Auth model:
-#   - LOCAL: sets ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN (bypasses OAuth path).
-#   - CLOUD: unsets both, plus ANTHROPIC_API_KEY, so Claude Code falls back to
-#            OAuth credentials in the macOS Keychain (the normal `claude login`
-#            state). If you have a saved real ANTHROPIC_API_KEY, it's restored.
+#   - LOCAL: sets ANTHROPIC_BASE_URL to the litellm proxy. Claude Code uses its
+#            existing Keychain OAuth; litellm ignores auth (disable_key_check: true).
+#   - CLOUD: unsets ANTHROPIC_BASE_URL, so Claude Code falls back to OAuth
+#            credentials in the macOS Keychain (the normal `claude login` state).
+#            If you have a saved real ANTHROPIC_API_KEY, it's restored.
+
+# Capture own path when sourced so public wrappers can auto-reload.
+# BASH_SOURCE[0] works in bash; ${(%):-%x} is the zsh equivalent.
+_LLM_SWITCH_PATH="${BASH_SOURCE[0]:-${(%):-%x}}"
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 _LLM_LLAMA_BASE="http://localhost:8081"
@@ -24,12 +30,20 @@ _LLM_LITELLM_CONFIG="${_LLM_CONFIG_DIR}/litellm_config.yaml"
 _LLM_SAVED_KEY_FILE="${_LLM_CONFIG_DIR}/saved_api_key"
 # ───────────────────────────────────────────────────────────────────────────────
 
-# Resolve the litellm CLI path, even if its install dir isn't on PATH.
+# Resolve the litellm CLI path, preferring Homebrew Python 3.11 install.
 _llm_litellm_bin() {
+    # Prefer Homebrew litellm (requires Python 3.11 — system Python 3.9 too old)
+    local brew_litellm="/opt/homebrew/bin/litellm"
+    if [[ -x "${brew_litellm}" ]]; then
+        echo "${brew_litellm}"
+        return 0
+    fi
+    # Fallback: litellm on PATH
     if command -v litellm &>/dev/null; then
         command -v litellm
         return 0
     fi
+    # Fallback: user site-packages
     local user_base
     user_base=$(python3 -m site --user-base 2>/dev/null)
     if [[ -n "${user_base}" && -x "${user_base}/bin/litellm" ]]; then
@@ -48,28 +62,41 @@ _llm_ensure_litellm() {
 }
 
 _llm_write_config() {
-    local model
-    model="$(_llm_get_model)"
+    local model i=0
+    # Retry up to 5s — server may still be starting when llm-local is first called.
+    while (( i < 10 )); do
+        model="$(_llm_get_model)"
+        [[ -n "${model}" ]] && break
+        sleep 0.5
+        (( i++ ))
+    done
     if [[ -z "${model}" ]]; then
-        echo "  Warning: could not detect model from llama-server — is it running?"
-        model="unknown"
+        echo "  Error: could not detect model from model server — is it running?"
+        echo "         Start ./mlx-server.sh (or ./llama-server.sh) first, then re-run llm-local."
+        return 1
     fi
     mkdir -p "${_LLM_CONFIG_DIR}"
     cat > "${_LLM_LITELLM_CONFIG}" <<EOF
-# litellm proxy config — routes any Claude model name to local llama.cpp
+# litellm proxy config — routes any Claude model name to local MLX backend
 model_list:
-  - model_name: "*"
+  - model_name: "claude-*"
     litellm_params:
-      model: openai/${model}
+      model: hosted_vllm/${model}
       api_base: ${_LLM_LLAMA_BASE}/v1
       api_key: "dummy"
-      extra_body:
-        chat_template_kwargs:
-          thinking: false
+    model_info:
+      max_tokens: 32768
+      max_input_tokens: 28672
+      max_output_tokens: 4096
 
 litellm_settings:
   drop_params: true
+  modify_params: true
   set_verbose: false
+  request_timeout: 600
+
+general_settings:
+  disable_key_check: true
 EOF
 }
 
@@ -85,16 +112,29 @@ _llm_backend_up() {
     curl -sf -m 2 "${_LLM_LLAMA_BASE}/v1/models" &>/dev/null
 }
 
-# Returns the first model ID advertised by the live llama-server.
+# Returns the model currently loaded by the running model server.
+# mlx_lm.server v0.31+ lists ALL cached models via /v1/models, not just the
+# active one — so we read the --model flag from the server process instead.
+# Falls back to the API first entry (correct for llama-server).
 _llm_get_model() {
+    # Primary: parse --model from the live process command line
+    local active
+    active=$(ps aux | grep -E '[m]lx_lm\.server|[l]lama-server' \
+        | grep -- '--model' \
+        | sed 's/.*--model //' | awk '{print $1}')
+    if [[ -n "${active}" ]]; then
+        echo "${active}"
+        return 0
+    fi
+    # Fallback: API (works correctly for llama-server single-model responses)
     curl -sf -m 2 "${_LLM_LLAMA_BASE}/v1/models" \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null
 }
 
 _llm_start_proxy() {
     if ! _llm_backend_up; then
-        echo "  Warning: llama-server not responding at ${_LLM_LLAMA_BASE}."
-        echo "           Start it first (e.g. ./llama-server.sh) or local calls will fail."
+        echo "  Warning: model server not responding at ${_LLM_LLAMA_BASE}."
+        echo "           Start it first (e.g. ./mlx-server.sh) or local calls will fail."
     fi
 
     if lsof -ti ":${_LLM_PROXY_PORT}" &>/dev/null; then
@@ -166,12 +206,11 @@ _llm_save_cloud_key() {
     fi
 }
 
-# ── Public commands ─────────────────────────────────────────────────────────────
-# In zsh, aliases shadow function definitions of the same name and cause a parse
-# error. Clear any aliases before defining our functions.
-unalias llm-local llm-cloud llm-status 2>/dev/null || true
+# ── Implementations ────────────────────────────────────────────────────────────
+# Named _impl so the public wrappers below can re-source this file (getting
+# fresh definitions) and then delegate — auto-reload without circular aliases.
 
-llm-local() {
+_llm_local_impl() {
     _llm_ensure_litellm || return 1
     _llm_save_cloud_key
 
@@ -181,28 +220,27 @@ llm-local() {
         _llm_start_proxy || return 1
     fi
 
-    # Use ANTHROPIC_AUTH_TOKEN (Bearer header) — unambiguous for custom proxies
-    # and won't collide with OAuth keychain creds. Clear ANTHROPIC_API_KEY so
-    # there's no stale value floating around.
+    # Only set ANTHROPIC_BASE_URL — litellm ignores auth (disable_key_check: true),
+    # so no stub API key needed. Avoids conflict with Keychain OAuth credentials.
     export ANTHROPIC_BASE_URL="${_LLM_PROXY_URL}"
-    export ANTHROPIC_AUTH_TOKEN="local-stub"
-    unset ANTHROPIC_API_KEY
+    unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_MODEL CLAUDE_SMALL_MODEL CLAUDE_LARGE_MODEL
 
     echo ""
     echo "Switched to LOCAL mode"
-    echo "  Model : $(_llm_get_model)"
-    echo "  Proxy : ${_LLM_PROXY_URL} → ${_LLM_LLAMA_BASE}"
-    echo "  Log   : ${_LLM_LOG_FILE}"
+    echo "  Model  : $(_llm_get_model)"
+    echo "  Proxy  : ${_LLM_PROXY_URL} → ${_LLM_LLAMA_BASE}"
+    echo "  Log    : ${_LLM_LOG_FILE}"
     echo ""
     echo "Run 'claude' to use Claude Code with the local model."
     echo "Run 'llm-cloud' to switch back."
 }
 
-llm-cloud() {
+_llm_cloud_impl() {
     _llm_stop_proxy
 
     # Wipe anything LOCAL set, then optionally restore a saved real key.
     unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY
+    unset CLAUDE_MODEL CLAUDE_SMALL_MODEL CLAUDE_LARGE_MODEL
 
     if [[ -f "${_LLM_SAVED_KEY_FILE}" ]]; then
         export ANTHROPIC_API_KEY="$(cat "${_LLM_SAVED_KEY_FILE}")"
@@ -221,22 +259,17 @@ llm-cloud() {
     echo ""
 }
 
-llm-status() {
+_llm_status_impl() {
     echo ""
     if [[ "${ANTHROPIC_BASE_URL:-}" == "${_LLM_PROXY_URL}" ]]; then
-        echo "Mode    : LOCAL  (via litellm proxy)"
+        echo "Mode    : LOCAL  (litellm proxy → model server)"
         echo "Proxy   : ${_LLM_PROXY_URL}"
         echo "Backend : ${_LLM_LLAMA_BASE}"
         echo "Model   : $(_llm_get_model)"
-        if _llm_proxy_running; then
-            echo "Proxy   : running"
-        else
-            echo "Proxy   : NOT running (stale env — run llm-local or llm-cloud)"
-        fi
         if _llm_backend_up; then
             echo "Backend : reachable"
         else
-            echo "Backend : NOT reachable at ${_LLM_LLAMA_BASE}"
+            echo "Backend : NOT reachable — start ./mlx-server.sh (or ./llama-server.sh)"
         fi
     elif [[ -z "${ANTHROPIC_BASE_URL:-}" || "${ANTHROPIC_BASE_URL}" == "https://api.anthropic.com" ]]; then
         echo "Mode    : CLOUD  (Anthropic)"
@@ -256,6 +289,20 @@ llm-status() {
     echo ""
 }
 
+# ── Public wrappers ─────────────────────────────────────────────────────────────
+# Re-source the script on every call so edits take effect immediately without
+# needing to open a new shell. The _impl functions above carry the real logic;
+# sourcing redefines them, then we delegate.
+#
+# In zsh, aliases shadow function definitions of the same name and cause a parse
+# error. Clear any aliases before defining our functions.
+unalias llm-local llm-cloud llm-status 2>/dev/null || true
+
+llm-local()  { source "${_LLM_SWITCH_PATH}"; _llm_local_impl  "$@"; }
+llm-cloud()  { source "${_LLM_SWITCH_PATH}"; _llm_cloud_impl  "$@"; }
+llm-status() { source "${_LLM_SWITCH_PATH}"; _llm_status_impl "$@"; }
+
+# ── Direct execution ────────────────────────────────────────────────────────────
 # When executed directly (not sourced), dispatch the argument as a command.
 # Note: llm-local / llm-cloud export env vars — those only persist when sourced.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -278,6 +325,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             exit 1
             ;;
     esac
-else
+elif [[ -z "${_LLM_SWITCH_LOADED:-}" ]]; then
+    # Only print the banner on the initial source, not on every auto-reload.
+    export _LLM_SWITCH_LOADED=1
     echo "llm-switch loaded. Commands: llm-local | llm-cloud | llm-status"
 fi

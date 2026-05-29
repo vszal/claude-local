@@ -1,166 +1,196 @@
 # local-claude-code
 
-Switch the Claude Code CLI between the Anthropic cloud and a **local** llama.cpp
-model — without touching `~/.claude/settings.json` or re-running `claude login`.
+Switch the [Claude Code](https://claude.ai/code) CLI between the Anthropic cloud
+and a **fully local** LLM — without touching `~/.claude/settings.json` or
+re-running `claude login`.
 
-A small litellm proxy translates between Anthropic's Messages API (what Claude
-Code speaks) and the OpenAI-compatible API exposed by llama-server.
+One environment variable (`ANTHROPIC_BASE_URL`) redirects Claude Code to a local
+[litellm](https://github.com/BerriAI/litellm) proxy, which translates between
+the Anthropic Messages API and the OpenAI-compatible API exposed by your local
+model server.
+
+## Architecture
 
 ```
-Claude Code (Anthropic SDK)
-        │ ANTHROPIC_BASE_URL=http://localhost:8082
-        │ ANTHROPIC_AUTH_TOKEN=local-stub
-        ▼
-  litellm proxy :8082  ß      ← translates Anthropic ↔ OpenAI format
-        │ api_base=http://localhost:8081/v1
-        ▼
-  llama.cpp :8081            ← your local model
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│   Claude Code  ──── POST /v1/messages ────▶  litellm proxy │
+│   (claude CLI)       localhost:8082          port 8082      │
+│        ▲                                        │           │
+│        │                                 translates to      │
+│   ANTHROPIC_BASE_URL                 /v1/chat/completions   │
+│   =http://localhost:8082                        │           │
+│                                        ┌────────▼────────┐  │
+│                                        │  Local model    │  │
+│                                        │  server :8081   │  │
+│                                        │                 │  │
+│                                        │  mlx_lm.server  │  │
+│                                        │  (MLX / Metal)  │  │
+│                                        │       or        │  │
+│                                        │  llama-server   │  │
+│                                        │  (llama.cpp)    │  │
+│                                        └─────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-The proxy is configured with `model_name: "*"`, so any Claude model name
-(`claude-opus-4-7`, `claude-sonnet-4-6`, etc.) is routed to the local model.
-You don't have to change Claude Code's `--model` flag.
+The litellm config maps `claude-*` model names to your local model, so Claude
+Code's `--model` flag needs no changes.
 
 ## Prerequisites
 
-- macOS with `llama.cpp` installed (`brew install llama.cpp` provides `llama-server`)
-- Python 3 with the litellm proxy extra:
+
+
+- **Python 3.11+** — required by litellm (system Python on macOS is too old;
+  install with `brew install python@3.11`)
+
+- **litellm proxy** (v1.80.x recommended):
   ```sh
-  pip3 install 'litellm[proxy]'
+  pip3.11 install 'litellm[proxy]==1.80.15'
   ```
-- A `claude login` session already completed (OAuth credentials in the macOS
-  Keychain) — see the [Authentication modes](#authentication-modes) section if
-  you want to use an API key instead.
+- **A local model server** — choose one:
+  - [mlx-lm](https://github.com/ml-explore/mlx-examples/tree/main/llms) for
+    Apple Silicon (fastest on Metal GPU):
+    ```sh
+    pip3 install 'mlx-lm>=0.25.2'
+    ```
+  - [llama.cpp](https://github.com/ggerganov/llama.cpp) for cross-platform GGUF
+    support:
+    ```sh
+    brew install llama.cpp
+    ```
+- A completed `claude login` session (OAuth credentials) **or** an
+  `ANTHROPIC_API_KEY` — needed for cloud mode.
 
-## One-time setup
+## Setup
 
-Add to your shell profile so commands are always available:
+Clone the repo and source the switch script from your shell profile:
 
 ```sh
-echo './llm-switch.sh' >> ~/.zshrc
+git clone https://github.com/your-username/local-claude-code.git
+echo 'source ~/path/to/local-claude-code/llm-switch.sh' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-(Adjust the path if you cloned this repo somewhere else.)
+## Local model server
 
-## Usage
+### Option A — Apple Silicon (MLX, recommended)
+
+Edit `mlx-server.sh` to set your model, then run it:
 
 ```sh
-llm-local     # Start litellm proxy, point Claude Code at the local model
-llm-cloud     # Stop proxy, restore Anthropic cloud
-llm-status    # Show current mode and which auth source is active
+# mlx-server.sh
+mlx_lm.server \
+  --model mlx-community/Qwen3-14B-4bit \   # swap for any MLX model
+  --host 127.0.0.1 \
+  --port 8081
 ```
 
-Start the local model server in a separate terminal first:
+```sh
+./mlx-server.sh
+```
+
+On first run, the model is downloaded from Hugging Face and cached locally.
+Subsequent starts skip the download.
+
+**Recommend using MLX models** on Apple Silicon, 16 GB+ unified memory.
+
+### Option B — llama.cpp (cross-platform)
+
+Edit `llama-server.sh` to set your model, then run it:
+
+```sh
+# llama-server.sh
+llama-server \
+  -m /path/to/your-model.gguf \
+  --n-gpu-layers 999 \
+  --ctx-size 32768 \
+  --port 8081
+```
 
 ```sh
 ./llama-server.sh
 ```
 
-Then switch modes from any shell where `llm-switch.sh` is sourced.
+## Usage
 
-## Authentication modes
-
-Claude Code accepts auth from **three** sources, in order of precedence when
-calling `api.anthropic.com`:
-
-1. `ANTHROPIC_AUTH_TOKEN` env var (sent as `Authorization: Bearer …`)
-2. `ANTHROPIC_API_KEY` env var (sent as `x-api-key: …`)
-3. OAuth credentials in the macOS Keychain (created by `claude login`,
-   stored under `Claude Code-credentials`)
-
-This script supports **both** OAuth (the default for most users) and exported
-API keys, and switches cleanly between them.
-
-### Local mode (always)
-
-`llm-local` sets:
-
-```
-ANTHROPIC_BASE_URL  = http://localhost:8082   # point at the proxy
-ANTHROPIC_AUTH_TOKEN = local-stub              # proxy accepts anything
-ANTHROPIC_API_KEY   = (unset)                  # avoid OAuth precedence collisions
-```
-
-`ANTHROPIC_AUTH_TOKEN` is used (rather than `ANTHROPIC_API_KEY`) deliberately:
-it sidesteps any "is this a real Anthropic key?" validation and won't compete
-with OAuth credentials in the Keychain.
-
-### Cloud mode — OAuth path (default)
-
-`llm-cloud` unsets all three Anthropic env vars. With nothing in the
-environment, Claude Code falls back to reading OAuth credentials from the
-Keychain — the normal `claude login` state.
-
-`llm-status` reports this as:
-
-```
-Mode    : CLOUD  (Anthropic)
-Auth    : OAuth credentials in Keychain
-```
-
-You don't need to do anything beyond `llm-cloud`. The script never touches the
-Keychain entry.
-
-### Cloud mode — API key path (dual mode, optional)
-
-If you prefer to use an exported `ANTHROPIC_API_KEY` (e.g. a workspace key, a
-service account, or a key with different rate limits than your OAuth login),
-the script preserves it across switches:
-
-1. **Before** running `llm-local`, export the key in your shell:
-   ```sh
-   export ANTHROPIC_API_KEY=sk-ant-…
-   ```
-2. `llm-local` saves it to `~/.config/llm-switch/saved_api_key` (mode 0600) so
-   the switch to local mode doesn't lose it.
-3. `llm-cloud` restores it back into the environment automatically.
-
-`llm-status` then reports:
-
-```
-Mode    : CLOUD  (Anthropic)
-Auth    : ANTHROPIC_API_KEY (108 chars)
-```
-
-To go back to OAuth-only mode, remove the saved file and unexport the key:
+Start the local model server first (in a separate terminal), then:
 
 ```sh
-rm ~/.config/llm-switch/saved_api_key
-unset ANTHROPIC_API_KEY
+llm-local     # start litellm proxy, redirect Claude Code to local model
+llm-cloud     # stop proxy, restore Anthropic cloud
+llm-status    # show current mode, proxy state, and backend reachability
 ```
 
-The next `llm-cloud` will fall back to Keychain OAuth.
+These commands are available in any shell that has sourced `llm-switch.sh`.
+Changes take effect immediately — no need to restart Claude Code.
 
-### Quick reference
+## How it works
 
-| Env state before `llm-cloud` | After `llm-cloud` | Claude Code uses |
-|---|---|---|
-| OAuth in Keychain, no saved key file | nothing exported | Keychain OAuth |
-| Saved key file exists | `ANTHROPIC_API_KEY` re-exported | API key |
-| Neither | nothing exported | Auth will fail — run `claude login` |
+`llm-local` sets a single environment variable:
+
+```sh
+ANTHROPIC_BASE_URL=http://localhost:8082
+```
+
+Claude Code reads this and sends all API requests to the litellm proxy instead
+of `api.anthropic.com`. The proxy:
+
+1. Receives `POST /v1/messages` (Anthropic Messages API)
+2. Translates to `POST /v1/chat/completions` (OpenAI API)
+3. Forwards to your local model server on port 8081
+4. Translates the response back
+5. Streams it to Claude Code
+
+`llm-cloud` unsets `ANTHROPIC_BASE_URL`, and Claude Code falls back to its
+normal cloud credentials (OAuth Keychain or `ANTHROPIC_API_KEY`).
+
+## Authentication
+
+Cloud mode supports two credential sources:
+
+| Source | How to set up | `llm-status` reports |
+|--------|--------------|----------------------|
+| OAuth (default) | Run `claude login` | `Auth: OAuth credentials in Keychain` |
+| API key | `export ANTHROPIC_API_KEY=sk-ant-…` | `Auth: ANTHROPIC_API_KEY (N chars)` |
+
+`llm-local` saves your API key (if set) to `~/.config/llm-switch/saved_api_key`
+(mode 0600) and restores it when you run `llm-cloud`, so switching modes never
+loses your key.
+
+## Configuration
+
+The litellm config is written to `~/.config/llm-switch/litellm_config.yaml`
+each time `llm-local` is run. It auto-detects the model name from the running
+server. You can also edit it directly to tune `max_tokens`, timeouts, etc.
+
+Key litellm settings used:
+
+```yaml
+litellm_settings:
+  drop_params: true      # silently drop Anthropic-only params unsupported by OpenAI
+  modify_params: true    # let litellm adjust params for the target backend
+  request_timeout: 600   # long timeout for slow local inference
+
+general_settings:
+  disable_key_check: true  # skip auth validation for local-only use
+```
+
+## Logs
+
+| File | Contents |
+|------|----------|
+| `~/.config/llm-switch/litellm.log` | litellm proxy stdout/stderr |
+| `~/.config/llm-switch/litellm.pid` | proxy process ID |
+| `~/.config/llm-switch/mlx-server.log` | mlx_lm.server stdout/stderr (if using mlx-server.sh) |
 
 ## Caveats
 
-- A smaller, local model behaves very differently from Claude — tool use, long
-  context, and complex reasoning will be weaker.
-- litellm drops unsupported parameters automatically (`drop_params: true`).
+- **Local models are weaker than Claude.** Tool use, long context, and complex
+  reasoning will be degraded compared to Claude
 - **Don't resume cloud sessions that contain local-mode turns.** Local model
-  responses can produce empty extended-thinking blocks that
-  `api.anthropic.com` rejects with `400 messages.N.content.0.thinking: each
-  thinking block must contain thinking`. Fix: run `/clear` in Claude Code, or
-  pick a non-thinking model with `/model` before going local.
-- Proxy logs: `~/.config/llm-switch/litellm.log`. Proxy PID: `~/.config/llm-switch/litellm.pid`.
-
-## Recommended llama-server tunings
-
-macOS limits the memory a single process can "wire" (lock into GPU/RAM). You
-can safely raise this to give the model more headroom. Run before starting
-the server:
-
-```sh
-sudo sysctl iogpu.wired_limit_mb=20000
-# iogpu.wired_limit_mb: 0 -> 20000
-```
-
-This setting resets on reboot.
+  responses can produce empty extended-thinking blocks that `api.anthropic.com`
+  rejects with a `400` error. Run `/clear` in Claude Code before switching modes.
+- **litellm version matters.** v1.83+ introduced an "experimental pass-through"
+  that breaks local backends. Pin to v1.80.x: `pip3 install 'litellm[proxy]==1.80.15'`.
+- **Context length.** Claude Code's system prompt is ~15k tokens. Set
+  `--ctx-size` to at least `32768` on your model server.
