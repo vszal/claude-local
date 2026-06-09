@@ -75,7 +75,12 @@ source ~/.zshrc
 
 ### Option A — Apple Silicon (MLX, recommended)
 
-Edit `mlx-server.sh` to set your model, then run it:
+> The full `mlx-server.sh` launcher now lives in the **agents** repo
+> (`~/Code/agents/local-llm-offload/mlx-server.sh`, reached via `~/.local/bin/mlx-server.sh`),
+> so it's a single source of truth shared with the skill-eval tooling. The `mlx-server.sh` here
+> is a thin stub that execs it — `./mlx-server.sh [alias]` still works as before.
+
+Run it (the stub forwards to the canonical launcher; default alias is `gemma12`):
 
 ```sh
 # mlx-server.sh
